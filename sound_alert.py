@@ -5,7 +5,8 @@ import time
 import sounddevice as sd
 import numpy as np
 import simpleaudio as sa
-import webrtcvad
+import torch
+from silero_vad import get_speech_timestamps, load_silero_vad
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(
@@ -15,15 +16,15 @@ parser.add_argument(
     "-t",
     "--threshold",
     type=float,
-    default=0.2,
+    default=0.1,
     help="Noise threshold level (0.0 to 1.0).",
 )
 parser.add_argument(
     "-s",
     "--speech_threshold",
     type=float,
-    default=0.05,
-    help="Speech threshold level (0.0 to 1.0).0.",
+    default=0.0,
+    help="Speech threshold level (0.0 to 1.0).",
 )
 parser.add_argument(
     "-f",
@@ -40,11 +41,11 @@ parser.add_argument(
     help="Minimum time in seconds between alarm repeats..",
 )
 parser.add_argument(
-    "-v",
-    "--vad_level",
+    "-l",
+    "--frame_length",
     type=int,
-    default=1,
-    help="VAD aggressiveness level (0 to 3).",
+    default=1000,
+    help="Length of each audio frame in milliseconds.",
 )
 args = parser.parse_args()
 
@@ -57,7 +58,6 @@ class SoundAlerter:
         alarm_wave,
         alarm_duration,
         sample_rate=16000,
-        vad_level=1,
     ):
         self.threshold = threshold
         self.speech_threshold = speech_threshold
@@ -68,10 +68,8 @@ class SoundAlerter:
         self.last_alarm_time = 0
 
         # Initialize VAD (Voice Activity Detection)
-        self.vad = webrtcvad.Vad(vad_level)
         self.sample_rate = sample_rate
-        self.frame_duration = 30  # ms
-        self.frame_size = int(self.sample_rate * self.frame_duration / 1000)
+        self.vad = load_silero_vad()
 
     def trigger_alarm(self, message):
         """Play the alarm sound."""
@@ -95,7 +93,10 @@ class SoundAlerter:
 
     def is_speech(self, audio_data):
         """Check if the audio data contains speech."""
-        return self.vad.is_speech(audio_data, self.sample_rate)
+        speech_timesteps = get_speech_timestamps(
+            audio_data, self.vad, return_seconds=True
+        )
+        return len(speech_timesteps) > 0
 
     def check_sound_level(self, indata, frames, time, status):
         """Callback function to process audio input."""
@@ -117,9 +118,10 @@ class SoundAlerter:
             self.trigger_alarm("\nNoise level exceeded threshold! (ALARM!)\n")
 
         # Speech recognition
-        audio_data = indata[:, 0].tobytes()
-        if rms_level > self.speech_threshold and self.is_speech(audio_data):
-            self.trigger_alarm("\nSpeech level exceeded threshold! (ALARM!)\n")
+        if rms_level > self.speech_threshold:
+            audio_data = torch.tensor(normalized_data[:, 0], dtype=torch.float32)
+            if self.is_speech(audio_data):
+                self.trigger_alarm("\nSpeech level exceeded threshold! (ALARM!)\n")
 
 
 # Load the alarm sound
@@ -130,19 +132,20 @@ except FileNotFoundError:
     print(f"Error: Alarm file '{args.alarm_file}' not found.")
     sys.exit(1)
 
-sample_rate = 16000
+SAMPLE_RATE = 16000
 alerter = SoundAlerter(
-    args.threshold, args.speech_threshold, alarm_wave_, args.alarm_duration, sample_rate
+    args.threshold, args.speech_threshold, alarm_wave_, args.alarm_duration, SAMPLE_RATE
 )
+blocks_size = int(SAMPLE_RATE * args.frame_length / 1000)
 
 try:
     print("Monitoring sound levels... Press Ctrl+C to stop.")
     with sd.InputStream(
         callback=alerter.check_sound_level,
         channels=1,
-        samplerate=sample_rate,
+        samplerate=SAMPLE_RATE,
         dtype="int16",
-        blocksize=alerter.frame_size,
+        blocksize=blocks_size,
     ):
         while True:
             sd.sleep(100)  # Keep the stream alive, check every 100ms
